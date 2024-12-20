@@ -85,8 +85,6 @@ async fn main() {
 
     let config = load_config("./config.yaml").expect("Failed to load config");
 
-    println!("{:?}", config);
-
     let domain_map = Arc::new(config.routes);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 80));
@@ -102,7 +100,7 @@ async fn main() {
 
     let server = Server::bind(&addr).serve(make_svc);
 
-    info!("Flare running on 0.0.0.0:{}", addr);
+    info!("Flare running on {}", addr);
 
     if let Err(e) = server.await {
         eprintln!("Server error: {}", e);
