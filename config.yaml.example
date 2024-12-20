@@ -1,0 +1,7 @@
+routes:
+  - route: "reroute1.somedomain.xyz"
+    forward: 3000
+  - route: "reroute2.somedomain.xyz"
+    forward: 3001
+  - route: "localhost"
+    forward: 3002
