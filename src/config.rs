@@ -8,6 +8,36 @@ pub struct Config {
     pub routes: Vec<Route>,
 }
 
+impl<'a> Config {
+    pub fn new(path: &str) -> Result<Config, Box<dyn std::error::Error>> {
+        let content = fs::read_to_string(path)?;
+        let config: Config = serde_yaml::from_str(&content)?;
+
+        Ok(config)
+    }
+
+    pub fn find_route(&self, route_name: &str) -> Option<&Route> {
+        self.routes.iter().find(|route| route.route == route_name)
+    }
+
+    pub fn host(&self) -> (Ipv4Addr, u16) {
+        let hostsep = self.addr.find(":")
+            .unwrap();
+    
+        let host = self.addr.get(0..hostsep)
+            .unwrap()
+            .parse::<Ipv4Addr>()
+            .unwrap();
+    
+        let port = self.addr.get(hostsep+1..self.addr.len())
+            .unwrap()
+            .parse::<u16>()
+            .unwrap();
+    
+        (host, port)
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct Route {
     pub route: String,
@@ -19,25 +49,4 @@ pub fn load_config(path: &str) -> Result<Config, Box<dyn std::error::Error>> {
     let config: Config = serde_yaml::from_str(&content)?;
 
     Ok(config)
-}
-
-pub fn find_route<'a>(routes: &'a Vec<Route>, route_name: &str) -> Option<&'a Route> {
-    routes.iter().find(|route| route.route == route_name)
-}
-
-pub fn split_host(host_raw: String) -> (Ipv4Addr, u16) {
-    let hostsep = host_raw.find(":")
-        .unwrap();
-
-    let host = host_raw.get(0..hostsep)
-        .unwrap()
-        .parse::<Ipv4Addr>()
-        .unwrap();
-
-    let port = host_raw.get(hostsep+1..host_raw.len())
-        .unwrap()
-        .parse::<u16>()
-        .unwrap();
-
-    (host, port)
 }

@@ -1,7 +1,7 @@
 #[macro_use]
 extern crate log;
 
-use config::{find_route, load_config, split_host, Route};
+use config::Config;
 use hyper::{Body, Client, Request, Response, Server};
 use hyper::service::{make_service_fn, service_fn};
 use hyper::http::StatusCode;
@@ -12,12 +12,12 @@ use std::sync::Arc;
 
 pub mod config;
 
-async fn handle_request(req: Request<Body>, domain_map: Arc<Vec<Route>>) -> Result<Response<Body>, Infallible> {
+async fn handle_request(req: Request<Body>, conf: Arc<Config>) -> Result<Response<Body>, Infallible> {
     // "Host" header determines where to reroute
     let host_header = req.headers().get("host").and_then(|value| value.to_str().ok());
 
     if let Some(host) = host_header {
-        if let Some(ref route) = find_route(&domain_map, host) {
+        if let Some(ref route) = conf.find_route(host) {
             let uri = req.uri();
             let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
@@ -83,16 +83,16 @@ async fn main() {
     .init()
     .unwrap();
 
-    let config = load_config("./config.yaml").expect("Failed to load config");
+    let config = Config::new("./config.yaml").expect("Failed to load config");
 
-    let addr = SocketAddr::from(split_host(config.addr));
-    let domain_map = Arc::new(config.routes);
+    let addr = SocketAddr::from(config.host());
+    let config = Arc::new(config);
 
     let make_svc = make_service_fn(move |_conn| {
-        let domain_map = Arc::clone(&domain_map);
+        let config = Arc::clone(&config);
         async move {
             Ok::<_, Infallible>(service_fn(move |req| {
-                handle_request(req, Arc::clone(&domain_map))
+                handle_request(req, Arc::clone(&config))
             }))
         }
     });
