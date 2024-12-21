@@ -1,7 +1,7 @@
 #[macro_use]
 extern crate log;
 
-use config::{find_route, load_config, Route};
+use config::{find_route, load_config, split_host, Route};
 use hyper::{Body, Client, Request, Response, Server};
 use hyper::service::{make_service_fn, service_fn};
 use hyper::http::StatusCode;
@@ -85,9 +85,8 @@ async fn main() {
 
     let config = load_config("./config.yaml").expect("Failed to load config");
 
+    let addr = SocketAddr::from(split_host(config.addr));
     let domain_map = Arc::new(config.routes);
-
-    let addr = SocketAddr::from(([0, 0, 0, 0], 80));
 
     let make_svc = make_service_fn(move |_conn| {
         let domain_map = Arc::clone(&domain_map);

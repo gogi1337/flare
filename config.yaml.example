@@ -1,3 +1,4 @@
+addr: 0.0.0.0:80
 routes:
   - route: "reroute1.somedomain.xyz"
     forward: 3000
