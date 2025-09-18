@@ -5,6 +5,8 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub addr: String,
+    pub disable_domain_not_configured_warns: bool,
+    pub disable_failed_to_reach_warns: bool,
     pub routes: Vec<Route>,
 }
 
@@ -41,7 +43,7 @@ impl<'a> Config {
 #[derive(Debug, Deserialize, Clone)]
 pub struct Route {
     pub route: String,
-    pub forward: u16,
+    pub forward: String,
 }
 
 pub fn load_config(path: &str) -> Result<Config, Box<dyn std::error::Error>> {

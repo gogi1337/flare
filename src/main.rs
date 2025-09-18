@@ -22,7 +22,7 @@ async fn handle_request(req: Request<Body>, conf: Arc<Config>) -> Result<Respons
             let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
             // Redirect to target server for the specified port
-            let target_uri = format!("http://127.0.0.1:{}{}", route.forward, path_and_query);
+            let target_uri = format!("{}{}", route.forward, path_and_query);
             let target_uri: String = target_uri.parse().unwrap();
 
             let client = Client::new();
@@ -47,14 +47,16 @@ async fn handle_request(req: Request<Body>, conf: Arc<Config>) -> Result<Respons
                         builder = builder.header(key, value);
                     }
 
-                    info!("REROUTE {} -> 0.0.0.0:{}", route.route, route.forward);
+                    debug!("{} -> {}", route.route, route.forward);
 
                     Ok(builder.body(response.into_body()).unwrap())
 
                 }
                 Err(_) => {
-                    error!("REROUTE {} -> 0.0.0.0:{} (FAILED TO REACH)", route.route, route.forward);
-
+                    if !conf.disable_failed_to_reach_warns {
+                        warn!("{} -> {} (Failed to reach)", route.route, route.forward);
+                    }
+                    
                     Ok(Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
                     .body(Body::from("Failed to proxy request"))
@@ -62,6 +64,10 @@ async fn handle_request(req: Request<Body>, conf: Arc<Config>) -> Result<Respons
                 },
             }
         } else {
+            if !conf.disable_domain_not_configured_warns {
+                warn!("{} (Domain not configured)", host);
+            }
+
             Ok(Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .body(Body::from("Domain not configured"))

@@ -1,8 +1,10 @@
 addr: 0.0.0.0:80
+disable_domain_not_configured_warns: true
+disable_failed_to_reach_warns: false
 routes:
   - route: "reroute1.somedomain.xyz"
-    forward: 3000
+    forward: "http://127.0.0.1:3000"
   - route: "reroute2.somedomain.xyz"
-    forward: 3001
+    forward: "http://127.0.0.1:3001"
   - route: "localhost"
-    forward: 3002
+    forward: "http://127.0.0.1:3002"
