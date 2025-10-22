@@ -1,12 +1,20 @@
 [package]
 name = "flare"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 [dependencies]
-hyper = { version = "0.14", features = ["full"] }
+# runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+hyper = { version = "0.14", features = ["http1", "server", "client", "tcp"] }
 log = "0.4.22"
 serde = { version = "1.0.216", features = ["derive"] }
 serde_yaml = "0.9.34"
 simple_logger = "5.0.0"
-tokio = { version = "1", features = ["full"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = 'abort'
+strip = true
