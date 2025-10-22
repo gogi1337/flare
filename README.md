@@ -1,5 +1,5 @@
 # Flare
-Simple reverse proxy server
+Minimal reverse proxy written in Rust with Tokio and Hyper.
 
 ## Notice
 - ⚠️ Not recommended to use in large-scale infrastructures.
