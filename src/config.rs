@@ -8,7 +8,21 @@ pub struct Config {
     pub addr: SocketAddr,
     pub disable_domain_not_configured_warns: bool,
     pub disable_failed_to_reach_warns: bool,
+    /// Max seconds to wait for an upstream to send response headers before replying 504
+    #[serde(default = "default_upstream_timeout")]
+    pub upstream_timeout_secs: u64,
+    /// Max seconds a client has to send its request headers before the connection is closed
+    #[serde(default = "default_header_read_timeout")]
+    pub header_read_timeout_secs: u64,
     pub routes: Vec<Route>,
+}
+
+fn default_upstream_timeout() -> u64 {
+    30
+}
+
+fn default_header_read_timeout() -> u64 {
+    10
 }
 
 impl Config {
@@ -20,18 +34,36 @@ impl Config {
     pub fn from_yaml(content: &str) -> Result<Config, Box<dyn std::error::Error>> {
         let mut config: Config = serde_yaml::from_str(content)?;
 
+        if config.upstream_timeout_secs == 0 || config.header_read_timeout_secs == 0 {
+            return Err(
+                "upstream_timeout_secs and header_read_timeout_secs must be greater than 0".into(),
+            );
+        }
+
         // Validate and normalize routes up front so bad config fails at startup,
         // not on the first request
         for route in &mut config.routes {
             route.route = route.route.to_ascii_lowercase();
             route.forward = route.forward.trim_end_matches('/').to_string();
 
-            let uri: Uri = route.forward.parse()
-                .map_err(|e| format!("route '{}': invalid forward '{}': {}", route.route, route.forward, e))?;
+            let uri: Uri = route.forward.parse().map_err(|e| {
+                format!(
+                    "route '{}': invalid forward '{}': {}",
+                    route.route, route.forward, e
+                )
+            })?;
 
             if uri.scheme().is_none() || uri.authority().is_none() {
                 return Err(format!(
                     "route '{}': forward '{}' must include scheme and host, e.g. http://127.0.0.1:3000",
+                    route.route, route.forward
+                ).into());
+            }
+
+            // The upstream client is plain HTTP only; https:// would pass parsing but fail on every request
+            if uri.scheme_str() != Some("http") {
+                return Err(format!(
+                    "route '{}': forward '{}' must use http:// (https upstreams are not supported yet)",
                     route.route, route.forward
                 ).into());
             }
@@ -43,7 +75,9 @@ impl Config {
     /// Finds a route by the request's Host header, ignoring port and case.
     pub fn find_route(&self, host: &str) -> Option<&Route> {
         let hostname = strip_port(host);
-        self.routes.iter().find(|route| route.route.eq_ignore_ascii_case(hostname))
+        self.routes
+            .iter()
+            .find(|route| route.route.eq_ignore_ascii_case(hostname))
     }
 }
 
@@ -75,7 +109,10 @@ mod tests {
             addr
         );
         for (route, forward) in routes {
-            s.push_str(&format!("  - route: \"{}\"\n    forward: \"{}\"\n", route, forward));
+            s.push_str(&format!(
+                "  - route: \"{}\"\n    forward: \"{}\"\n",
+                route, forward
+            ));
         }
         s
     }
@@ -111,12 +148,49 @@ mod tests {
         let err = Config::from_yaml(&yaml("0.0.0.0:80", &[("a.com", "127.0.0.1:3000")]))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("a.com"), "error should name the route: {}", err);
+        assert!(
+            err.contains("a.com"),
+            "error should name the route: {}",
+            err
+        );
     }
 
     #[test]
     fn rejects_unparseable_forward() {
         assert!(Config::from_yaml(&yaml("0.0.0.0:80", &[("a.com", "http://bad host")])).is_err());
+    }
+
+    #[test]
+    fn rejects_non_http_forward() {
+        for forward in ["https://127.0.0.1:3000", "ftp://127.0.0.1:21"] {
+            let err = Config::from_yaml(&yaml("0.0.0.0:80", &[("a.com", forward)]))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("http://"), "{}: {}", forward, err);
+        }
+    }
+
+    #[test]
+    fn timeouts_default_when_omitted() {
+        let c = Config::from_yaml(&yaml("0.0.0.0:80", &[])).unwrap();
+        assert_eq!(c.upstream_timeout_secs, 30);
+        assert_eq!(c.header_read_timeout_secs, 10);
+    }
+
+    #[test]
+    fn timeouts_can_be_set_and_must_be_positive() {
+        let base = yaml("0.0.0.0:80", &[]);
+
+        let c = Config::from_yaml(&format!(
+            "{}upstream_timeout_secs: 5\nheader_read_timeout_secs: 2\n",
+            base
+        ))
+        .unwrap();
+        assert_eq!(c.upstream_timeout_secs, 5);
+        assert_eq!(c.header_read_timeout_secs, 2);
+
+        assert!(Config::from_yaml(&format!("{}upstream_timeout_secs: 0\n", base)).is_err());
+        assert!(Config::from_yaml(&format!("{}header_read_timeout_secs: 0\n", base)).is_err());
     }
 
     #[test]
@@ -134,12 +208,18 @@ mod tests {
     fn find_route_ignores_port_and_case() {
         let c = Config::from_yaml(&yaml(
             "0.0.0.0:80",
-            &[("a.com", "http://127.0.0.1:1"), ("b.com", "http://127.0.0.1:2")],
+            &[
+                ("a.com", "http://127.0.0.1:1"),
+                ("b.com", "http://127.0.0.1:2"),
+            ],
         ))
         .unwrap();
 
         assert_eq!(c.find_route("a.com").unwrap().forward, "http://127.0.0.1:1");
-        assert_eq!(c.find_route("B.COM:8080").unwrap().forward, "http://127.0.0.1:2");
+        assert_eq!(
+            c.find_route("B.COM:8080").unwrap().forward,
+            "http://127.0.0.1:2"
+        );
         assert!(c.find_route("c.com").is_none());
         assert!(c.find_route("a.com.evil.net").is_none());
         assert!(c.find_route("").is_none());

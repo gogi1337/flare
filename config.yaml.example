@@ -1,6 +1,14 @@
 addr: 0.0.0.0:80
 disable_domain_not_configured_warns: true
 disable_failed_to_reach_warns: false
+
+# Optional, defaults shown.
+# Seconds to wait for an upstream's response headers before answering 504.
+upstream_timeout_secs: 30
+# Seconds a client has to send its request headers before the connection is closed.
+header_read_timeout_secs: 10
+
+# forward must be http:// (https upstreams are not supported yet).
 routes:
   - route: "reroute1.somedomain.xyz"
     forward: "http://127.0.0.1:3000"
