@@ -3,9 +3,9 @@ extern crate log;
 
 use config::Config;
 use hyper::client::HttpConnector;
-use hyper::header::{HeaderMap, HeaderName, HeaderValue, CONNECTION};
+use hyper::header::{HeaderMap, HeaderName, HeaderValue, CONNECTION, LOCATION};
 use hyper::http::StatusCode;
-use hyper::server::conn::AddrStream;
+use hyper::server::conn::{AddrStream, Http};
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Client, Request, Response, Server, Uri};
 use simple_logger::SimpleLogger;
@@ -13,10 +13,29 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
 
 pub mod config;
+pub mod tls;
 
 type HttpClient = Client<HttpConnector, Body>;
+
+/// Which listener a request came in on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scheme {
+    Http,
+    Https,
+}
+
+impl Scheme {
+    fn as_str(self) -> &'static str {
+        match self {
+            Scheme::Http => "http",
+            Scheme::Https => "https",
+        }
+    }
+}
 
 // Headers that only apply to a single connection and must not be forwarded (RFC 9110 §7.6.1)
 const HOP_BY_HOP: [&str; 8] = [
@@ -54,7 +73,12 @@ const X_FORWARDED_HOST: &str = "x-forwarded-host";
 
 /// Tells the upstream who the real client is. X-Forwarded-For is appended to (so an
 /// existing proxy chain is kept); the right-most entry is the one Flare vouches for.
-fn add_forwarded_headers(headers: &mut HeaderMap, client_addr: SocketAddr, host: HeaderValue) {
+fn add_forwarded_headers(
+    headers: &mut HeaderMap,
+    client_addr: SocketAddr,
+    host: HeaderValue,
+    scheme: Scheme,
+) {
     let client_ip = client_addr.ip().to_string();
     let xff = match headers.get(X_FORWARDED_FOR).and_then(|v| v.to_str().ok()) {
         Some(existing) if !existing.trim().is_empty() => format!("{}, {}", existing, client_ip),
@@ -64,8 +88,28 @@ fn add_forwarded_headers(headers: &mut HeaderMap, client_addr: SocketAddr, host:
     if let Ok(xff) = HeaderValue::from_str(&xff) {
         headers.insert(X_FORWARDED_FOR, xff);
     }
-    headers.insert(X_FORWARDED_PROTO, HeaderValue::from_static("http"));
+    headers.insert(X_FORWARDED_PROTO, HeaderValue::from_static(scheme.as_str()));
     headers.insert(X_FORWARDED_HOST, host);
+}
+
+/// 308 to the same host and path on the HTTPS listener. Only called for hosts that matched
+/// a configured route, so the Location can't point somewhere arbitrary.
+fn https_redirect(host: &str, https_port: u16, path_and_query: &str) -> Response<Body> {
+    let hostname = config::strip_port(host);
+    let location = if https_port == 443 {
+        format!("https://{}{}", hostname, path_and_query)
+    } else {
+        format!("https://{}:{}{}", hostname, https_port, path_and_query)
+    };
+
+    match HeaderValue::from_str(&location) {
+        Ok(location) => {
+            let mut res = error_response(StatusCode::PERMANENT_REDIRECT, "Redirecting to HTTPS");
+            res.headers_mut().insert(LOCATION, location);
+            res
+        }
+        Err(_) => error_response(StatusCode::BAD_REQUEST, "Invalid Host header"),
+    }
 }
 
 fn error_response(status: StatusCode, msg: &'static str) -> Response<Body> {
@@ -79,6 +123,7 @@ async fn handle_request(
     conf: Arc<Config>,
     client: HttpClient,
     client_addr: SocketAddr,
+    scheme: Scheme,
 ) -> Result<Response<Body>, Infallible> {
     // "Host" header determines where to reroute
     let host_value = match req.headers().get("host") {
@@ -118,6 +163,13 @@ async fn handle_request(
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or("/");
+
+    if scheme == Scheme::Http {
+        if let Some(tls) = conf.tls.as_ref().filter(|tls| tls.redirect_http) {
+            return Ok(https_redirect(host, tls.addr.port(), path_and_query));
+        }
+    }
+
     let target_uri: Uri = match format!("{}{}", route.forward, path_and_query).parse() {
         Ok(uri) => uri,
         Err(e) => {
@@ -134,7 +186,7 @@ async fn handle_request(
 
     *req.uri_mut() = target_uri;
     strip_hop_by_hop(req.headers_mut());
-    add_forwarded_headers(req.headers_mut(), client_addr, host_value.clone());
+    add_forwarded_headers(req.headers_mut(), client_addr, host_value.clone(), scheme);
 
     // Bounds the wait for response headers only; streaming the body afterwards is not limited
     let timeout = Duration::from_secs(conf.upstream_timeout_secs);
@@ -172,6 +224,67 @@ async fn handle_request(
     }
 }
 
+/// Accepts TCP connections, does the TLS handshake, then serves HTTP/1.1 over it.
+/// Each connection runs in its own task so a slow handshake never blocks others.
+async fn serve_tls(
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    conf: Arc<Config>,
+    client: HttpClient,
+) {
+    let header_read_timeout = Duration::from_secs(conf.header_read_timeout_secs);
+    let mut http = Http::new();
+    http.http1_only(true)
+        .http1_header_read_timeout(header_read_timeout);
+
+    loop {
+        let (tcp, client_addr) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                // e.g. out of file descriptors; back off instead of spinning
+                warn!("HTTPS accept failed: {}", e);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+
+        let acceptor = acceptor.clone();
+        let conf = Arc::clone(&conf);
+        let client = client.clone();
+        let http = http.clone();
+
+        tokio::spawn(async move {
+            // Bound the handshake too, so stalled clients can't pile up connections
+            let tls_stream =
+                match tokio::time::timeout(header_read_timeout, acceptor.accept(tcp)).await {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(e)) => {
+                        debug!("TLS handshake with {} failed: {}", client_addr, e);
+                        return;
+                    }
+                    Err(_) => {
+                        debug!("TLS handshake with {} timed out", client_addr);
+                        return;
+                    }
+                };
+
+            let service = service_fn(move |req| {
+                handle_request(
+                    req,
+                    Arc::clone(&conf),
+                    client.clone(),
+                    client_addr,
+                    Scheme::Https,
+                )
+            });
+
+            if let Err(e) = http.serve_connection(tls_stream, service).await {
+                debug!("HTTPS connection from {} ended: {}", client_addr, e);
+            }
+        });
+    }
+}
+
 #[tokio::main]
 async fn main() {
     SimpleLogger::new()
@@ -193,13 +306,44 @@ async fn main() {
 
     let header_read_timeout = Duration::from_secs(config.header_read_timeout_secs);
 
+    // Load certificates and bind 443 before anything starts, so a bad cert or a taken port
+    // fails loudly at startup instead of leaving a half-running proxy
+    let https = match &config.tls {
+        Some(tls) => {
+            let acceptor = match tls::build_acceptor(&config) {
+                Ok(acceptor) => acceptor,
+                Err(e) => {
+                    error!("Failed to load TLS certificates: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let listener = match TcpListener::bind(tls.addr).await {
+                Ok(listener) => listener,
+                Err(e) => {
+                    error!("Failed to bind {}: {}", tls.addr, e);
+                    std::process::exit(1);
+                }
+            };
+            Some((listener, acceptor))
+        }
+        None => None,
+    };
+
+    let http_config = Arc::clone(&config);
+    let http_client = client.clone();
     let make_svc = make_service_fn(move |conn: &AddrStream| {
-        let config = Arc::clone(&config);
-        let client = client.clone();
+        let config = Arc::clone(&http_config);
+        let client = http_client.clone();
         let client_addr = conn.remote_addr();
         async move {
             Ok::<_, Infallible>(service_fn(move |req| {
-                handle_request(req, Arc::clone(&config), client.clone(), client_addr)
+                handle_request(
+                    req,
+                    Arc::clone(&config),
+                    client.clone(),
+                    client_addr,
+                    Scheme::Http,
+                )
             }))
         }
     });
@@ -215,10 +359,28 @@ async fn main() {
         }
     };
 
-    info!("Flare running on {}", addr);
+    info!("Flare HTTP running on {}", addr);
 
-    if let Err(e) = server.await {
-        error!("Server error: {}", e);
+    let http = async {
+        if let Err(e) = server.await {
+            error!("HTTP server error: {}", e);
+        }
+    };
+
+    match https {
+        Some((listener, acceptor)) => {
+            if let Some(tls) = &config.tls {
+                info!("Flare HTTPS running on {}", tls.addr);
+                if tls.redirect_http {
+                    info!("Plain HTTP requests are redirected to HTTPS");
+                }
+            }
+            tokio::select! {
+                _ = http => {}
+                _ = serve_tls(listener, acceptor, Arc::clone(&config), client) => {}
+            }
+        }
+        None => http.await,
     }
 }
 
@@ -309,14 +471,27 @@ mod tests {
     const CLIENT: &str = "203.0.113.7:51234";
 
     async fn send(conf: &Arc<Config>, req: Request<Body>) -> (StatusCode, HeaderMap, String) {
+        send_as(conf, req, Scheme::Http).await
+    }
+
+    async fn send_as(
+        conf: &Arc<Config>,
+        req: Request<Body>,
+        scheme: Scheme,
+    ) -> (StatusCode, HeaderMap, String) {
         let res = handle_request(
             req,
             Arc::clone(conf),
             Client::new(),
             CLIENT.parse().unwrap(),
+            scheme,
         )
         .await
         .unwrap();
+        read_response(res).await
+    }
+
+    async fn read_response(res: Response<Body>) -> (StatusCode, HeaderMap, String) {
         let status = res.status();
         let headers = res.headers().clone();
         let body = to_bytes(res.into_body()).await.unwrap();
@@ -474,8 +649,200 @@ mod tests {
             &mut h,
             "[2001:db8::1]:443".parse().unwrap(),
             HeaderValue::from_static("a.com"),
+            Scheme::Http,
         );
         assert_eq!(h[X_FORWARDED_FOR], "2001:db8::1");
+    }
+
+    // ---- HTTPS ----
+
+    /// `tls:` section pointing at a fresh default cert for `default_name`. The tls.addr is a
+    /// placeholder: tests bind their own listener and only the port is used for redirects.
+    fn tls_section(default_name: &str, tls_port: u16, redirect: bool) -> String {
+        let (cert, key, _) = tls::write_test_cert(default_name);
+        format!(
+            "tls:\n  addr: 127.0.0.1:{}\n  cert: {}\n  key: {}\n  redirect_http: {}\n",
+            tls_port, cert, key, redirect
+        )
+    }
+
+    #[tokio::test]
+    async fn redirects_http_to_https_when_enabled() {
+        let conf = config_extra(
+            &tls_section("app.local", 443, true),
+            &[("app.local", "http://127.0.0.1:1".into())],
+        );
+
+        let (status, headers, _) = send(&conf, get("App.Local:80", "/a/b?x=1")).await;
+        assert_eq!(status, StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(headers[LOCATION], "https://App.Local/a/b?x=1");
+    }
+
+    #[tokio::test]
+    async fn redirect_keeps_non_default_https_port() {
+        let conf = config_extra(
+            &tls_section("app.local", 8443, true),
+            &[("app.local", "http://127.0.0.1:1".into())],
+        );
+
+        let (_, headers, _) = send(&conf, get("app.local:8080", "/")).await;
+        assert_eq!(headers[LOCATION], "https://app.local:8443/");
+    }
+
+    #[tokio::test]
+    async fn no_redirect_for_unknown_domain_or_when_disabled() {
+        let up = spawn_upstream().await;
+
+        let conf = config_extra(
+            &tls_section("app.local", 443, true),
+            &[("app.local", format!("http://{}", up))],
+        );
+        let (status, _, _) = send(&conf, get("other.local", "/")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let conf = config_extra(
+            &tls_section("app.local", 443, false),
+            &[("app.local", format!("http://{}", up))],
+        );
+        let (status, headers, _) = send(&conf, get("app.local", "/")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["x-seen-xfp"], "http");
+    }
+
+    #[tokio::test]
+    async fn https_requests_are_proxied_not_redirected() {
+        let up = spawn_upstream().await;
+        let conf = config_extra(
+            &tls_section("app.local", 443, true),
+            &[("app.local", format!("http://{}", up))],
+        );
+
+        let (status, headers, body) = send_as(&conf, get("app.local", "/x"), Scheme::Https).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "GET /x");
+        assert_eq!(headers["x-seen-xfp"], "https");
+    }
+
+    /// Starts `serve_tls` on a random port and returns its address.
+    async fn spawn_tls_proxy(conf: Arc<Config>) -> SocketAddr {
+        let acceptor = tls::build_acceptor(&conf).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_tls(listener, acceptor, conf, Client::new()));
+        addr
+    }
+
+    /// Connects over TLS with SNI `sni`, trusting only `trusted`, and sends GET / with
+    /// Host `sni`. Fails if the server's certificate isn't valid for `sni`.
+    async fn https_get(
+        proxy: SocketAddr,
+        sni: &str,
+        trusted: &[tokio_rustls::rustls::pki_types::CertificateDer<'static>],
+    ) -> Result<(StatusCode, HeaderMap, String), String> {
+        use tokio_rustls::rustls::{self, pki_types::ServerName};
+
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in trusted {
+            roots.add(cert.clone()).unwrap();
+        }
+        let client_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+
+        let tcp = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let name = ServerName::try_from(sni.to_string()).unwrap();
+        let tls = connector
+            .connect(name, tcp)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let (mut sender, conn) = hyper::client::conn::handshake(tls).await.unwrap();
+        tokio::spawn(conn);
+        let res = sender.send_request(get(sni, "/")).await.unwrap();
+        Ok(read_response(res).await)
+    }
+
+    #[tokio::test]
+    async fn serves_https_end_to_end() {
+        let up = spawn_upstream().await;
+        let (cert, key, der) = tls::write_test_cert("app.local");
+        let conf = config_extra(
+            &format!(
+                "tls:\n  addr: 127.0.0.1:1\n  cert: {}\n  key: {}\n",
+                cert, key
+            ),
+            &[("app.local", format!("http://{}", up))],
+        );
+        let proxy = spawn_tls_proxy(conf).await;
+
+        let (status, headers, body) = https_get(proxy, "app.local", &[der]).await.unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "GET /");
+        assert_eq!(headers["x-seen-xfp"], "https");
+        assert_eq!(headers["x-seen-xff"], "127.0.0.1");
+    }
+
+    #[tokio::test]
+    async fn picks_certificate_by_sni() {
+        let up = spawn_upstream().await;
+        let (default_cert, default_key, default_der) = tls::write_test_cert("a.local");
+        let (b_cert, b_key, b_der) = tls::write_test_cert("b.local");
+
+        let yaml = format!(
+            "addr: 127.0.0.1:0\ndisable_domain_not_configured_warns: true\ndisable_failed_to_reach_warns: true\n\
+             tls:\n  addr: 127.0.0.1:1\n  cert: {}\n  key: {}\n\
+             routes:\n\
+             \x20 - route: a.local\n    forward: http://{up}\n\
+             \x20 - route: b.local\n    forward: http://{up}\n    cert: {}\n    key: {}\n\
+             \x20 - route: c.local\n    forward: http://{up}\n",
+            default_cert, default_key, b_cert, b_key, up = up
+        );
+        let proxy = spawn_tls_proxy(Arc::new(Config::from_yaml(&yaml).unwrap())).await;
+        let trusted = [default_der, b_der];
+
+        // The client only accepts a cert valid for the name it asked for, so a successful
+        // handshake proves the right certificate was chosen
+        assert!(https_get(proxy, "a.local", &trusted).await.is_ok());
+        assert!(https_get(proxy, "b.local", &trusted).await.is_ok());
+
+        // c.local has no cert of its own: it gets the default (a.local) cert, which the
+        // client rejects because the name doesn't match
+        let err = https_get(proxy, "c.local", &trusted).await.unwrap_err();
+        assert!(err.to_lowercase().contains("name"), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn rejects_untrusted_and_plain_http_on_tls_port() {
+        let (cert, key, _) = tls::write_test_cert("app.local");
+        let conf = config_extra(
+            &format!(
+                "tls:\n  addr: 127.0.0.1:1\n  cert: {}\n  key: {}\n",
+                cert, key
+            ),
+            &[("app.local", "http://127.0.0.1:1".into())],
+        );
+        let proxy = spawn_tls_proxy(conf).await;
+
+        // A client that doesn't trust the cert must fail the handshake
+        let (_, _, other) = tls::write_test_cert("app.local");
+        assert!(https_get(proxy, "app.local", &[other]).await.is_err());
+
+        // Plain HTTP to the TLS port gets no HTTP response; the proxy keeps running after
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut tcp = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        tcp.write_all(b"GET / HTTP/1.1\r\nHost: app.local\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(2), tcp.read_to_end(&mut buf)).await;
+        assert!(!buf.starts_with(b"HTTP/"));
+
+        assert!(tokio::net::TcpStream::connect(proxy).await.is_ok());
     }
 
     #[tokio::test]

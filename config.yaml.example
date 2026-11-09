@@ -8,11 +8,23 @@ upstream_timeout_secs: 30
 # Seconds a client has to send its request headers before the connection is closed.
 header_read_timeout_secs: 10
 
+# Optional HTTPS listener. Remove the leading "# " to enable.
+# cert is the full chain (e.g. Let's Encrypt's fullchain.pem), key is the private key.
+# tls:
+#   addr: 0.0.0.0:443
+#   cert: /etc/letsencrypt/live/somedomain.xyz/fullchain.pem
+#   key: /etc/letsencrypt/live/somedomain.xyz/privkey.pem
+#   redirect_http: true   # answer plain HTTP for these routes with a 308 to HTTPS
+
 # forward must be http:// (https upstreams are not supported yet).
+# A route may set its own cert/key; it's served when the client asks for that domain (SNI),
+# otherwise the tls.cert above is used.
 routes:
   - route: "reroute1.somedomain.xyz"
     forward: "http://127.0.0.1:3000"
   - route: "reroute2.somedomain.xyz"
     forward: "http://127.0.0.1:3001"
+    # cert: /etc/letsencrypt/live/reroute2.somedomain.xyz/fullchain.pem
+    # key: /etc/letsencrypt/live/reroute2.somedomain.xyz/privkey.pem
   - route: "localhost"
     forward: "http://127.0.0.1:3002"

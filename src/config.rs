@@ -14,7 +14,23 @@ pub struct Config {
     /// Max seconds a client has to send its request headers before the connection is closed
     #[serde(default = "default_header_read_timeout")]
     pub header_read_timeout_secs: u64,
+    /// Optional HTTPS listener. Without it Flare serves plain HTTP only.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
     pub routes: Vec<Route>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct TlsConfig {
+    /// Address for the HTTPS listener, e.g. 0.0.0.0:443
+    pub addr: SocketAddr,
+    /// PEM certificate chain used when no route-specific certificate matches the SNI name
+    pub cert: String,
+    /// PEM private key for `cert`
+    pub key: String,
+    /// Answer plain HTTP requests for configured routes with a 308 redirect to HTTPS
+    #[serde(default)]
+    pub redirect_http: bool,
 }
 
 fn default_upstream_timeout() -> u64 {
@@ -67,6 +83,35 @@ impl Config {
                     route.route, route.forward
                 ).into());
             }
+
+            match (&route.cert, &route.key) {
+                (None, None) => {}
+                (Some(_), Some(_)) if config.tls.is_none() => {
+                    return Err(format!(
+                        "route '{}': has cert/key but there is no `tls` section",
+                        route.route
+                    )
+                    .into());
+                }
+                (Some(_), Some(_)) => {}
+                _ => {
+                    return Err(format!(
+                        "route '{}': cert and key must be set together",
+                        route.route
+                    )
+                    .into());
+                }
+            }
+        }
+
+        if let Some(tls) = &config.tls {
+            if tls.addr == config.addr {
+                return Err(format!(
+                    "tls.addr {} is the same as addr; HTTP and HTTPS need different ports",
+                    tls.addr
+                )
+                .into());
+            }
         }
 
         Ok(config)
@@ -82,7 +127,7 @@ impl Config {
 }
 
 /// "example.com:8080" -> "example.com", "[::1]:8080" -> "[::1]"
-fn strip_port(host: &str) -> &str {
+pub fn strip_port(host: &str) -> &str {
     if host.starts_with('[') {
         match host.find(']') {
             Some(end) => &host[..=end],
@@ -97,6 +142,11 @@ fn strip_port(host: &str) -> &str {
 pub struct Route {
     pub route: String,
     pub forward: String,
+    /// Optional certificate for this domain, served when the client's SNI matches `route`
+    #[serde(default)]
+    pub cert: Option<String>,
+    #[serde(default)]
+    pub key: Option<String>,
 }
 
 #[cfg(test)]
@@ -223,6 +273,65 @@ mod tests {
         assert!(c.find_route("c.com").is_none());
         assert!(c.find_route("a.com.evil.net").is_none());
         assert!(c.find_route("").is_none());
+    }
+
+    const TLS: &str = "tls:\n  addr: 0.0.0.0:443\n  cert: c.pem\n  key: k.pem\n";
+
+    #[test]
+    fn tls_is_optional() {
+        let c = Config::from_yaml(&yaml("0.0.0.0:80", &[])).unwrap();
+        assert!(c.tls.is_none());
+    }
+
+    #[test]
+    fn parses_tls_section() {
+        let c = Config::from_yaml(&format!("{}{}", TLS, yaml("0.0.0.0:80", &[]))).unwrap();
+        let tls = c.tls.unwrap();
+        assert_eq!(tls.addr, "0.0.0.0:443".parse().unwrap());
+        assert_eq!(tls.cert, "c.pem");
+        assert_eq!(tls.key, "k.pem");
+        assert!(!tls.redirect_http);
+    }
+
+    #[test]
+    fn rejects_tls_on_same_port_as_http() {
+        let tls = "tls:\n  addr: 0.0.0.0:80\n  cert: c.pem\n  key: k.pem\n";
+        assert!(Config::from_yaml(&format!("{}{}", tls, yaml("0.0.0.0:80", &[]))).is_err());
+    }
+
+    fn route_with_cert(cert: Option<&str>, key: Option<&str>) -> String {
+        let mut s = "  - route: a.com\n    forward: http://127.0.0.1:1\n".to_string();
+        if let Some(c) = cert {
+            s.push_str(&format!("    cert: {}\n", c));
+        }
+        if let Some(k) = key {
+            s.push_str(&format!("    key: {}\n", k));
+        }
+        s
+    }
+
+    #[test]
+    fn route_cert_and_key_must_come_together() {
+        let base = format!("{}{}", TLS, yaml("0.0.0.0:80", &[]));
+        let ok = format!("{}{}", base, route_with_cert(Some("a.pem"), Some("a.key")));
+        let c = Config::from_yaml(&ok).unwrap();
+        assert_eq!(c.routes[0].cert.as_deref(), Some("a.pem"));
+
+        let only_cert = format!("{}{}", base, route_with_cert(Some("a.pem"), None));
+        let only_key = format!("{}{}", base, route_with_cert(None, Some("a.key")));
+        assert!(Config::from_yaml(&only_cert).is_err());
+        assert!(Config::from_yaml(&only_key).is_err());
+    }
+
+    #[test]
+    fn route_cert_requires_tls_section() {
+        let s = format!(
+            "{}{}",
+            yaml("0.0.0.0:80", &[]),
+            route_with_cert(Some("a.pem"), Some("a.key"))
+        );
+        let err = Config::from_yaml(&s).unwrap_err().to_string();
+        assert!(err.contains("tls"), "{}", err);
     }
 
     #[test]

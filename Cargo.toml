@@ -11,6 +11,7 @@ log = "0.4.22"
 serde = { version = "1.0.216", features = ["derive"] }
 serde_yaml = "0.9.34"
 simple_logger = "5.0.0"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 
 [profile.release]
 opt-level = 3
@@ -18,3 +19,7 @@ lto = true
 codegen-units = 1
 panic = 'abort'
 strip = true
+
+[dev-dependencies]
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+tokio = { version = "1", features = ["io-util"] }
